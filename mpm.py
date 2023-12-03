@@ -1,5 +1,7 @@
 import taichi as ti
 import taichi.math as tm
+import torch
+import numpy as np
 
 @ti.data_oriented
 class MPM:
@@ -37,12 +39,11 @@ class MPM:
         self.v3 = ti.Vector.field(3, dtype=float, shape=(self.n_rods, self.d_num3))
         self.C3 = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3))
         self.F3 = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3))  # elastic deformation
-        self.Q3 = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3), needs_grad=True)  # QR decomposition
-        self.R3 = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3), needs_grad=True)  # QR decomposition
+        self.Q3 = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3))  # QR decomposition
+        self.R3 = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3))  # QR decomposition
         self.D3_inv = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3))
         self.d3 = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3))  # tangent and normal
         self.volumn3 = ti.field(dtype=float, shape=(self.n_rods, self.d_num3))
-        self.energy = ti.field(dtype=float, shape=(self.n_rods, self.d_num3), needs_grad=True)     # energy density
 
         # grid info
         self.grid_mv = ti.Vector.field(3, dtype=float, shape=(self.n_grid, self.n_grid, self.n_grid))  # momentum
@@ -50,7 +51,14 @@ class MPM:
         self.grid_v = ti.Vector.field(3, dtype=float, shape=(self.n_grid, self.n_grid, self.n_grid))
         self.grid_f = ti.Vector.field(3, dtype=float, shape=(self.n_grid, self.n_grid, self.n_grid))
         self.grid_tag = ti.field(dtype=int, shape=(self.n_grid, self.n_grid, self.n_grid))       # if m = 0, tag = 0
-        
+
+        # auto diff: torch  ||  to ti.Matrix: numpy
+        self.R3_t = torch.empty((self.n_rods, self.d_num3, 3, 3), dtype=torch.float32)
+        self.Q3_t = torch.empty((self.n_rods, self.d_num3, 3, 3), dtype=torch.float32)
+        self.R3_n_grad = np.empty((self.n_rods, self.d_num3, 3, 3), dtype=np.float32)
+        self.Q3_n_grad = np.empty((self.n_rods, self.d_num3, 3, 3), dtype=np.float32)
+
+    
     @ti.func
     def QR3(self, A: ti.types.template(), Q: ti.types.template(), R: ti.types.template()):
         # QR decomposition
@@ -92,28 +100,28 @@ class MPM:
         R3 = ti.Matrix([[1.0, 0.0, 0.0], [0.0, r22, r23], [0.0, 0.0, r33]])
         return R1, R2, R3
 
-    @ti.kernel
     def Compute_energy_grad(self, i, j):
-        with ti.ad.Tape(self.energy[i, j]):
-            R = self.R3[i, j]
-            r11 = R[0, 0]
-            r22 = R[1, 1]
-            r33 = R[2, 2]
-            r23 = R[1, 2]
-            r12 = R[0, 1] / (r11 * r22)
-            r13 = (R[0, 2] / r11 - r12 * r23) / r33
-            f = 0.5 * self.k * (r11 - 1) ** 2
-            g = 0.5 * self.gamma * (r12 ** 2 + r13 ** 2)
-            R3 = ti.Matrix([[1.0, 0.0, 0.0], [0.0, r22, r23], [0.0, 0.0, r33]])
-            U, S, V = ti.svd(R3)
-            s = tm.log(S)
-            h = self.mu * (s[0, 0] ** 2 + s[1, 1] ** 2 + s[2, 2] ** 2) + 0.5 * self.lam * (s[0, 0] + s[1, 1] + s[2, 2]) ** 2
-            self.energy[i, j] = f + g + h
+        R = self.R3_t[i, j]
+        r11 = R[0, 0]
+        r22 = R[1, 1]
+        r33 = R[2, 2]
+        r23 = R[1, 2]
+        r12 = R[0, 1] / (r11 * r22)
+        r13 = (R[0, 2] / r11 - r12 * r23) / r33
+        f = 0.5 * self.k * (r11 - 1) ** 2
+        g = 0.5 * self.gamma * (r12 ** 2 + r13 ** 2)
+        R3 = torch.tensor([[1.0, 0.0, 0.0], [0.0, r22, r23], [0.0, 0.0, r33]])
+        U, S, V = torch.svd(R3)
+        s = torch.log(S)
+        h = self.mu * (s[0] ** 2 + s[1] ** 2 + s[2] ** 2) + 0.5 * self.lam * (s[0] + s[1] + s[2]) ** 2
+        energy = f + g + h
+        energy.backward()
+        self.R3_n_grad[i, j] = self.R3_t.grad.numpy()[i, j]
 
     @ti.kernel
     def Compute_Piola_Kirchhoff(self, i, j)-> ti.types.template():
         self.Compute_energy_grad(i, j)
-        de_dR = self.R3[i, j].grad
+        de_dR = ti.Matrix(self.R3_n_grad[i, j])
         K = de_dR @ (self.R3[i, j].transpose())
         L = ti.Matrix.zero(float, 3, 3)
         D = ti.Matrix.zero(float, 3, 3)
@@ -192,9 +200,8 @@ class MPM:
             
         # (iii) particles
         for i, j in self.x3:
-            self.QR3(self.d3[i, j], self.Q3[i, j], self.R3[i, j])
             self.Compute_energy_grad(i, j)
-            de_dR = self.R3[i, j].grad
+            de_dR = ti.Matrix(self.R3_n_grad[i, j])
             K = de_dR @ (self.R3[i, j].transpose())
             L = ti.Matrix.zero(float, 3, 3)
             D = ti.Matrix.zero(float, 3, 3)
@@ -218,6 +225,17 @@ class MPM:
                     w_grad = 4 * weight * dpos * (self.inv_dx ** 2)
                     f = - self.volumn3[i, j] * (d1.dot(w_grad) * c1 + d2.dot(w_grad) * c2)
                     self.grid_f[base + offset] += f
+
+    @ti.kernel
+    def QR_decomposition(self):
+        for i, j in self.x3:
+            self.QR3(self.d3[i, j], self.Q3[i, j], self.R3[i, j])
+
+    def trans_QR(self):
+        self.Q3_t = self.Q3.to_torch(keep_dims = True)
+        self.R3_t = self.R3.to_torch(keep_dims = True)
+        self.Q3_t.requires_grad = True
+        self.R3_t.requires_grad = True
 
     @ti.kernel
     def Update_Grid(self):
@@ -307,7 +325,6 @@ class MPM:
     def Return_Mapping(self):
         # QR decomposition, change R
         for i, j in self.x3:
-            self.QR3(self.d3[i, j], self.Q3[i, j], self.R3[i, j])
             R1, R2, R3 = self.R123(self.R3[i, j])
             U, S, V = ti.svd(R3)
             E = tm.log(S)
@@ -341,17 +358,32 @@ class MPM:
             self.R3[i, j] = R1 @ R2 @ R3
             self.d3[i, j] = self.Q3[i, j] @ self.R3[i, j]
             self.F3[i, j] = self.d3[i, j] @ self.D3_inv[i, j]
+    
+    def grad_zero(self):
+        self.R3_t.grad.zero_()
+        self.Q3_t.grad.zero_()
             
     def Step(self):
         # standard MPM pipeline
         self.Particle_to_Gird()
         self.Grid_velocity()
+        
+        # ti.Matrix.field to tensor, to_tensor is a kernel
+        self.QR_decomposition()
+        self.trans_QR()
+
         self.Grid_Force()
+
+        self.grad_zero()
+
         self.Update_Grid()
         self.Grid_to_Particle()
         self.Update_Deformation_Gradient()
         self.Update_Particle()
+        self.QR_decomposition()
+        self.trans_QR()
         self.Return_Mapping()
+        self.grad_zero()
 
     def initialize(self, X):
         for i in range(self.n_rods):
