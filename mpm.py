@@ -87,37 +87,22 @@ class MPM:
             for k in range(i):
                 D[i, i] -= L[i, k] * D[k, k] * U[k, i]
     
-    @ti.func
-    def R123(self, R: ti.types.template()):
-        r11 = R[0, 0]
-        r22 = R[1, 1]
-        r33 = R[2, 2]
-        r23 = R[1, 2]
-        r12 = R[0, 1] / (r11 * r22)
-        r13 = (R[0, 2] / r11 - r12 * r23) / r33
-        R1 = ti.Matrix([[r11, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-        R2 = ti.Matrix([[1.0, r12, r13], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-        R3 = ti.Matrix([[1.0, 0.0, 0.0], [0.0, r22, r23], [0.0, 0.0, r33]])
-        return R1, R2, R3
-
+    # paper and supplement are contradictory, paper：R3 decomposition, supplement：R3 slice, which is simple
     def Compute_energy_grad(self, i, j):
-        R = self.R3_t[i, j]
-        r11 = R[0, 0]
-        r22 = R[1, 1]
-        r33 = R[2, 2]
-        r23 = R[1, 2]
-        r12 = R[0, 1] / (r11 * r22)
-        r13 = (R[0, 2] / r11 - r12 * r23) / r33
-        f = 0.5 * self.k * (r11 - 1) ** 2
-        g = 0.5 * self.gamma * (r12 ** 2 + r13 ** 2)
-        R3 = torch.tensor([[1.0, 0.0, 0.0], [0.0, r22, r23], [0.0, 0.0, r33]])
-        U, S, V = torch.svd(R3)
+        r11 = self.R3_t[0, 0]
+        r12 = self.R3_t[0, 1]
+        r13 = self.R3_t[0, 2]
+        f = 0.5 * 2000 * (r11 - 1) ** 2
+        g = 0.5 * 10 * (r12 ** 2 + r13 ** 2)
+        U, S, V = torch.svd(self.R3_t[1:, 1:])
         s = torch.log(S)
-        h = self.mu * (s[0] ** 2 + s[1] ** 2 + s[2] ** 2) + 0.5 * self.lam * (s[0] + s[1] + s[2]) ** 2
+        h = 23.077 * (s[0] ** 2 + s[1] ** 2) + 0.5 * 34.615 * (s[0] + s[1]) ** 2
         energy = f + g + h
         energy.backward()
         self.R3_n_grad[i, j] = self.R3_t.grad.numpy()[i, j]
 
+
+    # Compute stress
     @ti.kernel
     def Compute_Piola_Kirchhoff(self, i, j)-> ti.types.template():
         self.Compute_energy_grad(i, j)
@@ -127,7 +112,7 @@ class MPM:
         D = ti.Matrix.zero(float, 3, 3)
         U = ti.Matrix.zero(float, 3, 3)
         self.LDU(K, L, D, U)
-        de_dd = self.Q3[i, j] @ (U + U.transpose() - D) @ ti.Matrix.inverse(self.Q3[i, j]).transpose()
+        de_dd = self.Q3[i, j] @ (U + U.transpose() - D) @ ti.Matrix.inverse(self.R3[i, j]).transpose()
         P = de_dd @ ti.Matrix.inverse(self.D3_inv[i, j]).transpose() @ ti.Matrix.inverse(self.F3[i, j]).transpose()
         stress = 1/tm.determinant(self.F3[i, j]) * P @ self.F3[i, j].transpose()
         return stress
@@ -207,7 +192,7 @@ class MPM:
             D = ti.Matrix.zero(float, 3, 3)
             U = ti.Matrix.zero(float, 3, 3)
             self.LDU(K, L, D, U)
-            de_dd = self.Q3[i, j] @ (U + U.transpose() - D) @ ti.Matrix.inverse(self.Q3[i, j]).transpose()
+            de_dd = self.Q3[i, j] @ (U + U.transpose() - D) @ ti.Matrix.inverse(self.R3[i, j]).transpose()
             de_dF = de_dd @ ti.Matrix.inverse(self.D3_inv[i, j]).transpose()
             c1 = ti.Vector([de_dF[0, 1], de_dF[1, 1], de_dF[2, 1]])
             c2 = ti.Vector([de_dF[0, 2], de_dF[1, 2], de_dF[2, 2]])
@@ -325,18 +310,18 @@ class MPM:
     def Return_Mapping(self):
         # QR decomposition, change R
         for i, j in self.x3:
-            R1, R2, R3 = self.R123(self.R3[i, j])
+            sR3 = self.R3[i, j]
+            R3 = ti.Matrix([[sR3[1, 1], sR3[1, 2]], [sR3[2, 1], sR3[2, 2]]])
             U, S, V = ti.svd(R3)
             E = tm.log(S)
-            e1 = E[1, 1]
-            e2 = E[2, 2]
+            e1 = E[0, 0]
+            e2 = E[1, 1]
             if e1 < e2:
                 e1, e2 = e2, e1
             stress = self.Compute_Piola_Kirchhoff(i, j)
-            stress_Q = self.Q3[i, j].transpose() @ stress @ self.Q3[i, j]
-            J2 = (stress_Q[1, 1] - stress_Q[2, 2]) ** 2 + 4 * stress_Q[1, 2]
-            condition1 = tm.sqrt(J2) + 0.5 * self.alpha * (stress_Q[1, 1] + stress_Q[2, 2])
-            condition2 = tm.sqrt(stress_Q[0, 1] ** 2 + stress_Q[0, 2] ** 2) + 0.5 * self.beta * (stress_Q[1, 1] + stress_Q[2, 2])
+            J2 = (stress[1, 1] - stress[2, 2]) ** 2 + 4 * stress[1, 2]
+            condition1 = tm.sqrt(J2) + 0.5 * self.alpha * (stress[1, 1] + stress[2, 2])
+            condition2 = tm.sqrt(stress[0, 1] ** 2 + stress[0, 2] ** 2) + 0.5 * self.beta * (stress[1, 1] + stress[2, 2])
 
             # volume preserving (R3)
             if e1 + e2 >= 0:
@@ -345,17 +330,20 @@ class MPM:
                 n = 0.5 * (e1 - e2) + ((self.alpha * self.lam) / (4 * self.mu)) * (e1 + e2)
                 e1 -= n
                 e2 -= n
-            E[1, 1] = e1
-            E[2, 2] = e2
+            E[0, 0] = e1
+            E[1, 1] = e2
             R3 = U @ tm.exp(E) @ V.transpose()
             
             # sheering tangent (R2)
             if condition2 > 0:
-                scale = - (self.beta * (stress_Q[1, 1] + stress_Q[2, 2])) / (2 * ti.sqrt(stress_Q[0, 1] ** 2 + stress_Q[1, 2] ** 2))
-                R2[0, 1] *= scale
-                R2[0, 2] *= scale
+                scale = - (self.beta * (stress[1, 1] + stress[2, 2])) / (2 * ti.sqrt(stress[0, 1] ** 2 + stress[1, 2] ** 2))
+                self.R3[i, j][0, 1] *= scale
+                self.R3[i, j][0, 2] *= scale
             
-            self.R3[i, j] = R1 @ R2 @ R3
+            self.R3[i, j][1, 1] = R3[0, 0]
+            self.R3[i, j][1, 2] = R3[0, 1]
+            self.R3[i, j][2, 1] = R3[1, 0]
+            self.R3[i, j][2, 2] = R3[1, 1]
             self.d3[i, j] = self.Q3[i, j] @ self.R3[i, j]
             self.F3[i, j] = self.d3[i, j] @ self.D3_inv[i, j]
     
