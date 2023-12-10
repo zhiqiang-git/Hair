@@ -8,8 +8,9 @@ class MPM:
     def __init__(self, n_rods, n_vertices):
         # Only simulate Hair, so no (i) particles
         # parameters obtained from the paper Table1 and Table2
-        self.n_grid = 1000
-        self.dx = 1e-2   # grid size is 10
+        self.n_grid = 256
+        self.dx = 2e-2   # grid size is 10
+        self.x_base = ti.Vector([-2.56, -2.56, -2.56])
         self.inv_dx = 1 / self.dx
         self.rho = 1
         self.dt = 1e-4         # time step
@@ -44,6 +45,8 @@ class MPM:
         self.D3_inv = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3))
         self.d3 = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3))  # tangent and normal
         self.volumn3 = ti.field(dtype=float, shape=(self.n_rods, self.d_num3))
+        self.de_dR = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3))
+        self.stress = ti.Matrix.field(3, 3, dtype=float, shape=(self.n_rods, self.d_num3))
 
         # grid info
         self.grid_mv = ti.Vector.field(3, dtype=float, shape=(self.n_grid, self.n_grid, self.n_grid))  # momentum
@@ -57,12 +60,14 @@ class MPM:
         self.Q3_t = torch.empty((self.n_rods, self.d_num3, 3, 3), dtype=torch.float32)
         self.R3_n_grad = np.empty((self.n_rods, self.d_num3, 3, 3), dtype=np.float32)
         self.Q3_n_grad = np.empty((self.n_rods, self.d_num3, 3, 3), dtype=np.float32)
+        self.energy = 0.0
 
     
     @ti.func
     def QR3(self, A: ti.types.template(), Q: ti.types.template(), R: ti.types.template()):
         # QR decomposition
-        for i in range(A.shape[1]):
+        # 3D Matrix
+        for i in range(3):
             v = A[:, i]
             for j in range(i):
                 R[j, i] = Q[:, j].dot(A[:, i])
@@ -73,13 +78,13 @@ class MPM:
     @ti.func
     def LDU(self, A: ti.types.template(), L: ti.types.template(), D: ti.types.template(), U: ti.types.template()):
         # LDU decomposition
-        for i in range(A.shape[1]):
+        for i in range(3):
             for j in range(i):
                 L[i, j] = A[i, j]
                 for k in range(j):
                     L[i, j] -= L[i, k] * D[k, k] * U[k, j]
                 L[i, j] /= D[j, j]
-            for j in range(i, A.shape[1]):
+            for j in range(i, 3):
                 U[i, j] = A[i, j]
                 for k in range(i):
                     U[i, j] -= L[i, k] * D[k, k] * U[k, j]
@@ -88,34 +93,51 @@ class MPM:
                 D[i, i] -= L[i, k] * D[k, k] * U[k, i]
     
     # paper and supplement are contradictory, paper：R3 decomposition, supplement：R3 slice, which is simple
-    def Compute_energy_grad(self, i, j):
-        r11 = self.R3_t[0, 0]
-        r12 = self.R3_t[0, 1]
-        r13 = self.R3_t[0, 2]
-        f = 0.5 * 2000 * (r11 - 1) ** 2
-        g = 0.5 * 10 * (r12 ** 2 + r13 ** 2)
-        U, S, V = torch.svd(self.R3_t[1:, 1:])
-        s = torch.log(S)
-        h = 23.077 * (s[0] ** 2 + s[1] ** 2) + 0.5 * 34.615 * (s[0] + s[1]) ** 2
-        energy = f + g + h
-        energy.backward()
-        self.R3_n_grad[i, j] = self.R3_t.grad.numpy()[i, j]
+    def Compute_energy_grad(self):
+        for i in range(self.n_rods):
+            for j in range(self.d_num3):
+                r11 = self.R3_t[i, j, 0, 0]
+                r12 = self.R3_t[i, j, 0, 1]
+                r13 = self.R3_t[i, j, 0, 2]
+                f = 0.5 * 2000 * (r11 - 1) ** 2
+                g = 0.5 * 10 * (r12 ** 2 + r13 ** 2)
+                U, S, V = torch.svd(self.R3_t[i, j, 1:, 1:])
+                s = torch.log(S)
+                h = 23.077 * (s[0] ** 2 + s[1] ** 2) + 0.5 * 34.615 * (s[0] + s[1]) ** 2
+                self.energy += f + g + h
+        self.energy.backward()
+        self.R3_n_grad = self.R3_t.grad.numpy()
 
+    @ti.kernel
+    def Compute_de_dR(self, arr:ti.types.ndarray()):
+        for i, j in self.de_dR:
+            self.de_dR[i, j][0, 0]=arr[i, j, 0, 0]
+            self.de_dR[i, j][0, 1]=arr[i, j, 0, 1]
+            self.de_dR[i, j][0, 2]=arr[i, j, 0, 2]
+            self.de_dR[i, j][1, 0]=arr[i, j, 1, 0]
+            self.de_dR[i, j][1, 1]=arr[i, j, 1, 1]
+            self.de_dR[i, j][1, 2]=arr[i, j, 1, 2]
+            self.de_dR[i, j][2, 0]=arr[i, j, 2, 0]
+            self.de_dR[i, j][2, 1]=arr[i, j, 2, 1]
+            self.de_dR[i, j][2, 2]=arr[i, j, 2, 2]
+
+    def Compute_grad(self):
+        self.Compute_energy_grad()
+        self.Compute_de_dR(self.R3_n_grad)
 
     # Compute stress
     @ti.kernel
-    def Compute_Piola_Kirchhoff(self, i, j)-> ti.types.template():
-        self.Compute_energy_grad(i, j)
-        de_dR = ti.Matrix(self.R3_n_grad[i, j])
-        K = de_dR @ (self.R3[i, j].transpose())
-        L = ti.Matrix.zero(float, 3, 3)
-        D = ti.Matrix.zero(float, 3, 3)
-        U = ti.Matrix.zero(float, 3, 3)
-        self.LDU(K, L, D, U)
-        de_dd = self.Q3[i, j] @ (U + U.transpose() - D) @ ti.Matrix.inverse(self.R3[i, j]).transpose()
-        P = de_dd @ ti.Matrix.inverse(self.D3_inv[i, j]).transpose() @ ti.Matrix.inverse(self.F3[i, j]).transpose()
-        stress = 1/tm.determinant(self.F3[i, j]) * P @ self.F3[i, j].transpose()
-        return stress
+    def Compute_Piola_Kirchhoff(self):
+        for i, j in self.x3:
+            K = self.de_dR[i, j] @ (self.R3[i, j].transpose())
+            L = ti.Matrix.zero(float, 3, 3)
+            D = ti.Matrix.zero(float, 3, 3)
+            U = ti.Matrix.zero(float, 3, 3)
+            self.LDU(K, L, D, U)
+            de_dd = self.Q3[i, j] @ (U + U.transpose() - D) @ ti.Matrix.inverse(self.R3[i, j]).transpose()
+            P = de_dd @ ti.Matrix.inverse(self.D3_inv[i, j]).transpose() @ ti.Matrix.inverse(self.F3[i, j]).transpose()
+            self.stress[i, j] = 1/tm.determinant(self.F3[i, j]) * P @ self.F3[i, j].transpose()
+
 
     @ti.kernel
     def Particle_to_Gird(self):
@@ -124,7 +146,7 @@ class MPM:
             self.grid_mv[i, j, k] = ti.Vector.zero(float, 3)
 
         for i, j in self.x2:
-            base = (self.x2[i, j] * self.inv_dx - 0.5).cast(int)
+            base = ((self.x2[i, j] - self.x_base) * self.inv_dx - 0.5).cast(int)
             fx = self.x2[i, j] * self.inv_dx - base.cast(float)
             w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2]
             affine = self.C2[i, j]
@@ -136,7 +158,7 @@ class MPM:
                 self.grid_mv[base + offset] += weight * mass * (self.v2[i, j] + affine @ dpos)
 
         for i, j in self.x3:
-            base = (self.x3[i, j] * self.inv_dx - 0.5).cast(int)
+            base = ((self.x3[i, j] - self.x_base) * self.inv_dx - 0.5).cast(int)
             fx = self.x3[i, j] * self.inv_dx - base.cast(float)
             w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2]
             affine = self.C3[i, j]
@@ -185,9 +207,7 @@ class MPM:
             
         # (iii) particles
         for i, j in self.x3:
-            self.Compute_energy_grad(i, j)
-            de_dR = ti.Matrix(self.R3_n_grad[i, j])
-            K = de_dR @ (self.R3[i, j].transpose())
+            K = self.de_dR[i, j] @ (self.R3[i, j].transpose())
             L = ti.Matrix.zero(float, 3, 3)
             D = ti.Matrix.zero(float, 3, 3)
             U = ti.Matrix.zero(float, 3, 3)
@@ -200,7 +220,7 @@ class MPM:
             d2 = ti.Vector([self.d3[i, j][0, 2], self.d3[i, j][1, 2], self.d3[i, j][2, 2]])
 
             # grad_weight
-            base = (self.x3[i, j] * self.inv_dx - 0.5).cast(int)
+            base = ((self.x3[i, j] - self.x_base) * self.inv_dx - 0.5).cast(int)
             fx = self.x3[i, j] * self.inv_dx - base.cast(float)
             w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2]
             for offset in ti.static(ti.grouped(ti.ndrange(3, 3, 3))):
@@ -248,8 +268,8 @@ class MPM:
         # Lagrangian and Eularian gradient
         for i, j in self.x3:
             dc1 = self.x2[i, j+1] - self.x2[i, j]
-            dc2 = ti.Vector(self.d3[i, j][0, 1], self.d3[i, j][1, 1], self.d3[i, j][2, 1])
-            dc3 = ti.Vector(self.d3[i, j][0, 2], self.d3[i, j][1, 2], self.d3[i, j][2, 2])
+            dc2 = ti.Vector([self.d3[i, j][0, 1], self.d3[i, j][1, 1], self.d3[i, j][2, 1]])
+            dc3 = ti.Vector([self.d3[i, j][0, 2], self.d3[i, j][1, 2], self.d3[i, j][2, 2]])
             dc2 += self.dt * self.C3[i, j] @ dc2
             dc3 += self.dt * self.C3[i, j] @ dc3
             self.d3[i, j] = ti.Matrix.cols([dc1, dc2, dc3])
@@ -261,7 +281,7 @@ class MPM:
         # Only update positions of (i) and (ii),
         # and calculate (iii) as the barycenters of (ii)
         for i, j in self.x2:
-            base = (self.x2[i, j] * self.inv_dx - 0.5).cast(int)
+            base = ((self.x2[i, j] - self.x_base) * self.inv_dx - 0.5).cast(int)
             fx = self.x2[i, j] * self.inv_dx - base.cast(float)
             w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2]
             new_v = ti.Vector.zero(float, 3)
@@ -281,7 +301,7 @@ class MPM:
             self.C2[i, j] = C_k + self.damping * C_s
         
         for i, j in self.x3:
-            base = (self.x3[i, j] * self.inv_dx - 0.5).cast(int)
+            base = ((self.x3[i, j] - self.x_base) * self.inv_dx - 0.5).cast(int)
             fx = self.x3[i, j] * self.inv_dx - base.cast(float)
             w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2]
             new_C = ti.Matrix.zero(float, 3, 3)
@@ -303,8 +323,8 @@ class MPM:
             self.x2[i, j] += self.dt * self.v2[i, j]
         
         for i, j in self.x3:
-            self.x3[i, j] = 0.5 (self.x2[i, j] + self.x2[i, j+1])
-            self.v3[i, j] = 0.5 (self.v2[i, j] + self.v2[i, j+1])
+            self.x3[i, j] = 0.5 * (self.x2[i, j] + self.x2[i, j+1])
+            self.v3[i, j] = 0.5 * (self.v2[i, j] + self.v2[i, j+1])
 
     @ti.kernel
     def Return_Mapping(self):
@@ -318,7 +338,7 @@ class MPM:
             e2 = E[1, 1]
             if e1 < e2:
                 e1, e2 = e2, e1
-            stress = self.Compute_Piola_Kirchhoff(i, j)
+            stress = self.stress[i, j]
             J2 = (stress[1, 1] - stress[2, 2]) ** 2 + 4 * stress[1, 2]
             condition1 = tm.sqrt(J2) + 0.5 * self.alpha * (stress[1, 1] + stress[2, 2])
             condition2 = tm.sqrt(stress[0, 1] ** 2 + stress[0, 2] ** 2) + 0.5 * self.beta * (stress[1, 1] + stress[2, 2])
@@ -349,7 +369,8 @@ class MPM:
     
     def grad_zero(self):
         self.R3_t.grad.zero_()
-        self.Q3_t.grad.zero_()
+        # self.Q3_t.grad.zero_()
+        self.energy = 0.0
             
     def Step(self):
         # standard MPM pipeline
@@ -359,44 +380,52 @@ class MPM:
         # ti.Matrix.field to tensor, to_tensor is a kernel
         self.QR_decomposition()
         self.trans_QR()
-
+        self.Compute_grad()
         self.Grid_Force()
-
         self.grad_zero()
-
         self.Update_Grid()
         self.Grid_to_Particle()
         self.Update_Deformation_Gradient()
         self.Update_Particle()
         self.QR_decomposition()
         self.trans_QR()
+        self.Compute_grad()
+        self.Compute_Piola_Kirchhoff()
         self.Return_Mapping()
         self.grad_zero()
 
-    def initialize(self, X):
+    @ti.kernel
+    def initialize_x2(self):
+        for i, j in self.x2:
+            self.v2[i, j] = ti.Vector.zero(float, 3)
+            self.C2[i, j] = ti.Matrix.zero(float, 3, 3)
+            self.volumn2[i, j] = 0
+
+    @ti.kernel
+    def initialize_x3(self):
+        for i, j in self.x3:
+            self.x3[i, j] = 0.5 * (self.x2[i, j] + self.x2[i, j+1])
+            self.v3[i, j] = ti.Vector.zero(float, 3)
+            self.C3[i, j] = ti.Matrix.zero(float, 3, 3)
+            self.F3[i, j] = ti.Matrix.identity(float, 3)
+            d1 = self.x2[i, j+1] - self.x2[i, j]
+            v = tm.cross(d1, ti.Vector([0, 1.0, 0]))
+            if tm.length(v) < 1e-6:
+                v = tm.cross(d1, ti.Vector([1.0, 0, 0]))
+            d2 = v
+            d3 = tm.cross(d1, d2)
+            self.d3[i, j] = ti.Matrix.cols([d1, d2, d3])
+            self.D3_inv[i, j] = ti.Matrix.inverse(self.d3[i, j])
+            l = self.x2[i, j+1] - self.x2[i, j]
+            self.volumn3[i, j] = 0.5 * tm.length(l) * self.rho
+            self.volumn2[i, j] += 0.5 * self.volumn3[i, j]
+            self.volumn2[i, j+1] += 0.5 * self.volumn3[i, j]
+
+    def initialize(self, X:list):
         for i in range(self.n_rods):
             for j in range(self.d_num2):
                 self.x2[i, j] = X[i * self.d_num2 + j]
-                self.v2[i, j] = ti.Vector.zero(float, 3)
-                self.C2[i, j] = ti.Matrix.zero(float, 3, 3)
-                self.volumn2[i, j] = 0
-        
-        for i in range(self.n_rods):
-            for j in range(self.d_num3):
-                self.x3[i, j] = 0.5 * (self.x2[i, j] + self.x2[i, j+1])
-                self.v3[i, j] = ti.Vector.zero(float, 3)
-                self.C3[i, j] = ti.Matrix.zero(float, 3, 3)
-                self.F3[i, j] = ti.Matrix.identity(float, 3)
-                d1 = self.x2[i, j+1] - self.x2[i, j]
-                v = tm.cross(d1, ti.Vector([0, 1.0, 0]))
-                if tm.length(v) < 1e-6:
-                    v = tm.cross(d1, ti.Vector([1.0, 0, 0]))
-                d2 = v
-                d3 = tm.cross(d1, d2)
-                self.d3[i, j] = ti.Matrix.cols([d1, d2, d3])
-                self.D3_inv[i, j] = ti.Matrix.inverse(self.d3[i, j])
-                l = self.x2[i, j+1] - self.x2[i, j]
-                self.volumn3[i, j] = 0.5 * tm.length(l) * self.rho
-                self.volumn2[i, j] += 0.5 * self.volumn3[i, j]
-                self.volumn2[i, j+1] += 0.5 * self.volumn3[i, j]
+
+        self.initialize_x2()
+        self.initialize_x3()
 
